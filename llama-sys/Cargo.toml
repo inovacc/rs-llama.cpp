@@ -1,0 +1,7 @@
+[package]
+name = "llama-sys"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+links = "llama_binding"
+build = "build.rs"
