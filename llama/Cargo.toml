@@ -7,3 +7,4 @@ license = "BSD-3-Clause"
 [dependencies]
 llama-sys = { path = "../llama-sys" }
 thiserror = "1"
+byteorder = "1"
