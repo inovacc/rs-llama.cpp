@@ -1,0 +1,94 @@
+name: CI
+
+# rs-llama.cpp builds llama.cpp FROM SOURCE (llama-sys/build.rs runs CMake +
+# Ninja against the `llama.cpp` submodule, then compiles the C++ shim) and
+# .cargo/config.toml pins the whole workspace to the x86_64-pc-windows-gnu
+# target (the shim links against MinGW-gcc-built static archives, which an
+# MSVC-ABI Rust toolchain cannot consume). So CI runs on windows-latest with
+# a MinGW toolchain, not the default MSVC host triple.
+#
+# The native build is heavy (a full llama.cpp + mtmd CPU build every cold
+# run), so cargo + the cmake build directory are cached via Swatinem/rust-cache.
+#
+# Model/vision tests (gated on LLAMA_TEST_MODEL / LLAMA_TEST_VISION_MODEL /
+# LLAMA_TEST_MMPROJ) have no GGUF fixtures available on hosted runners, so
+# they self-skip (see README.md's Testing section) — this is expected, not a
+# CI gap.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust (stable, x86_64-pc-windows-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: rustfmt, clippy
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      # windows-latest ships MSYS2 at C:\msys64 but its MinGW gcc/g++ are not
+      # on PATH by default (and the preinstalled MSYS2 gcc may be missing the
+      # C++ standard library pieces the shim needs) — install a known-good
+      # MinGW toolchain explicitly via Chocolatey (preinstalled on hosted
+      # Windows runners) rather than relying on the ambient one.
+      - name: Install MinGW gcc/g++
+        run: choco install mingw --version=13.2.0 -y --no-progress
+        shell: pwsh
+
+      - name: Add MinGW to PATH
+        run: echo "C:\ProgramData\mingw64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Verify toolchain
+        run: |
+          gcc --version
+          g++ --version
+          ninja --version
+          cmake --version
+        shell: pwsh
+
+      # Caches ~/.cargo, target/, and (via cache-on-failure + workspaces) the
+      # llama-sys OUT_DIR cmake build tree, so the from-source llama.cpp/mtmd
+      # build is only paid for on cache misses (submodule pin changes, shim
+      # changes, or a cold cache).
+      - name: Cache cargo + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rs-llama-cpp-windows-gnu
+          cache-on-failure: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        shell: pwsh
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: pwsh
+
+      - name: cargo build
+        run: cargo build --workspace
+        shell: pwsh
+
+      # LLAMA_TEST_MODEL / LLAMA_TEST_VISION_MODEL / LLAMA_TEST_MMPROJ are
+      # intentionally left unset here: no GGUF model fixtures are shipped or
+      # downloaded in CI, so the gated model/vision tests in llama/src/model.rs
+      # self-skip (print "skipping ... not set" and return) rather than fail.
+      - name: cargo test
+        run: cargo test --workspace
+        shell: pwsh
