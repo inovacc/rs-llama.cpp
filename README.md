@@ -1,5 +1,5 @@
 # rs-llama.cpp
-<!-- rev:002 (RFC 3339) 2026-07-23T02:27:35Z -->
+<!-- rev:003 (RFC 3339) 2026-07-23T02:56:16Z -->
 
 Rust bindings to [llama.cpp](https://github.com/ggml-org/llama.cpp) — a
 faithful port of [go-llama.cpp](https://github.com/dyammarcano/go-llama.cpp)'s
@@ -64,7 +64,9 @@ long as you have:
 
 The from-source build currently targets **CPU only** (`GGML_CUDA=OFF`,
 `GGML_VULKAN=OFF`, `GGML_NATIVE=OFF` in `llama-sys/build.rs`) and that is what
-has been built and verified. CUDA and Vulkan backends are future work, not
+has been built and verified against llama.cpp release **b10091** (text:
+load/tokenize/predict/stream/chat; vision: `describe_image` via mtmd). CUDA and
+Vulkan backends are future work, not
 yet wired up or verified — see `llama-sys/build.rs` if you want to
 experiment.
 
