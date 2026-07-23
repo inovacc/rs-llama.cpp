@@ -28,6 +28,25 @@ use crate::options::{ModelOptions, PredictOptions};
 use crate::stream::Filter;
 use crate::vision::VisionModel;
 
+/// Clamps `requested` to `default` whenever it is non-positive.
+///
+/// `PredictOptions::tokens` is a public `i32`, so callers can pass zero *or a
+/// negative* value. The C side (`binding.cpp`'s `llama_tokenize_string`)
+/// derives its write capacity as `n_predict > 0 ? n_predict : toks.size()`,
+/// meaning a negative `n_predict` makes it fall back to writing the FULL
+/// token count — while a naive `== 0` check on the Rust side would still
+/// allocate an undersized (zero- or negative-derived) buffer for that case,
+/// causing a heap out-of-bounds write from safe Rust. Treating any
+/// `requested <= 0` as "use the default" keeps the Rust buffer capacity and
+/// the `n_predict` passed to C consistent, and always non-negative.
+fn effective_token_budget(requested: i32, default: i32) -> i32 {
+    if requested <= 0 {
+        default
+    } else {
+        requested
+    }
+}
+
 /// Newtype around the raw trait-object pointer stored in the registry.
 /// `*mut dyn FnMut(&str) -> bool` is not `Send`/`Sync` by default (it is a
 /// raw pointer to a foreign, possibly-!Send closure); this wrapper asserts
@@ -376,7 +395,7 @@ impl Model {
     /// A negative return from `llama_tokenize_string` maps to
     /// `Err(LlamaError::Inference)`.
     pub fn tokenize(&self, text: &str, opts: &PredictOptions) -> Result<Vec<i32>> {
-        let effective_tokens = if opts.tokens == 0 { 4096 } else { opts.tokens };
+        let effective_tokens = effective_token_budget(opts.tokens, 4096);
         // Matches Go's `TokenizeString` (`llama.go` line 398): the real
         // antiprompt list is not marshalled there either (it passes a nil
         // double-pointer), so `pass_antiprompt = false` here reproduces that
@@ -421,7 +440,7 @@ impl Model {
     /// overflow guard below returns `OutOfMemory` rather than attempting an
     /// unbounded allocation).
     pub fn predict(&self, prompt: &str, opts: &PredictOptions) -> Result<String> {
-        let effective_tokens = if opts.tokens == 0 { 99_999_999 } else { opts.tokens };
+        let effective_tokens = effective_token_budget(opts.tokens, 99_999_999);
         // Matches Go's `Predict`/`PredictResult` (`llama.go` lines 260, 324):
         // both pass `nil, 0` for the antiprompt array because stop-sequence
         // detection happens Go-side via the filtering sink, not in C. This
@@ -516,7 +535,7 @@ impl Model {
         opts: &PredictOptions,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<String> {
-        let effective_tokens = if opts.tokens == 0 { 99_999_999 } else { opts.tokens };
+        let effective_tokens = effective_token_budget(opts.tokens, 99_999_999);
         let guard = self.allocate_params(prompt, opts, effective_tokens, false)?;
 
         let mut filter = Filter::new(opts.stop_prompts.clone());
@@ -872,6 +891,33 @@ mod tests {
             return;
         };
         let opts = PredictOptions::default();
+        let toks = model
+            .tokenize("The quick brown fox", &opts)
+            .expect("tokenize failed");
+        assert!(!toks.is_empty());
+    }
+
+    #[test]
+    fn effective_token_budget_clamps_non_positive_to_default() {
+        assert_eq!(effective_token_budget(-1, 4096), 4096);
+        assert_eq!(effective_token_budget(0, 4096), 4096);
+        assert_eq!(effective_token_budget(i32::MIN, 4096), 4096);
+        assert_eq!(effective_token_budget(1, 4096), 1);
+        assert_eq!(effective_token_budget(32, 4096), 32);
+    }
+
+    #[test]
+    fn tokenize_negative_tokens_does_not_overflow_buffer() {
+        let Some(model) = test_model() else {
+            eprintln!(
+                "skipping tokenize_negative_tokens_does_not_overflow_buffer: LLAMA_TEST_MODEL not set"
+            );
+            return;
+        };
+        let opts = PredictOptions {
+            tokens: -1,
+            ..Default::default()
+        };
         let toks = model
             .tokenize("The quick brown fox", &opts)
             .expect("tokenize failed");

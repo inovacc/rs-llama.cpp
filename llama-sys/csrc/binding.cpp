@@ -575,6 +575,10 @@ int mtmd_describe(void *mtmd_ctx, void *state, const char *image_path,
     text.parse_special = true;
 
     mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+    if (chunks == nullptr) {
+        mtmd_bitmap_free(bm.bitmap);
+        return -6;
+    }
     const mtmd_bitmap *bitmaps[1] = { bm.bitmap };
     int32_t trc = mtmd_tokenize(mctx, chunks, &text, bitmaps, 1);
     if (trc != 0) {

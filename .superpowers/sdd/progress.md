@@ -38,3 +38,27 @@ NOT-YET-VERIFIED: all M3 inference paths compile-only until user supplies LLAMA_
 
 Task 3.4 (streaming): complete (commit 0a5060c, 67 tests, env-gated skip). Real tokenCallback registry (Mutex<HashMap<usize,_>> keyed by state ptr) replaced the stub; predict_stream + stream::Filter stop-detection; predict now passes nil,0 antiprompt (Go Predict parity); allocate_params gained pass_antiprompt flag (true branch = Go Eval, currently no caller until eval() ported).
   FINAL-REVIEW MUST-CHECK: predict_stream uses transmute for callback lifetime-erasure — soundness depends on CallbackGuard unregistering before closure frame drops (implementer verified all paths incl FFI-error early return). Highest-risk unsafe in the port.
+Clippy cleanup: complete (commit 882d1a8). cargo clippy --workspace --all-targets -D warnings = CLEAN. 67 tests. tokenCallback now unsafe extern "C" + Safety doc.
+Model files (user-provided): TEXT=C:\Users\dyamm\.lmstudio\models\lmstudio-community\phi-4-GGUF\phi-4-Q4_K_M.gguf (8.6GB, 14B). VISION=...\gemma-4-E4B-it-GGUF\gemma-4-E4B-it-Q4_K_M.gguf (5.1GB) + mmproj-gemma-4-E4B-it-BF16.gguf (946MB).
+
+M3 FFI VERIFIED (debug build, phi-4): load + tokenize + embeddings-disabled = 3 passed in 10.8s. C shim links+runs against real 14B model; load_model/allocate_params/tokenize marshalling + error mapping confirmed real.
+Remaining M3 verify: predict + streaming (need RELEASE llama.cpp build — debug 14B gen too slow). M3.6 Go-parity smoke deferred (needs Go binary built). Building release now.
+
+=== M3 FULLY VERIFIED (phi-4, release build) ===
+predict + 2 streaming model tests + all stream unit tests = 24 passed, 0 failed, 749.64s. Text-side FFI wrapper works end-to-end against real 14B model. Release build of llama.cpp cached.
+M3.6 Go-parity byte-exact smoke: DEFERRED/optional (needs building the Go go-llama.cpp binary to capture expected output; port already demonstrably works).
+Next: M4 vision (mtmd shim + describe_image), verify vs gemma-4-E4B + mmproj.
+
+=== MILESTONE 4 COMPLETE + VERIFIED (mtmd vision) ===
+Commits 93be1a3 (shim mtmd wrappers + build/link libmtmd), 9c7b521 (describe_image).
+VERIFIED: describe_image(red-circle fixture) on gemma-4-E4B + mmproj → "The image is a solid red circle centered on a white background." Full mtmd pipeline works; gemma vision supported by pin.
+API: Model::load_mmproj(&self, mmproj)->Result<VisionModel>; Model::describe_image(&self,&VisionModel,image_path,prompt)->Result<String>; VisionModel Drop->mtmd_free_ctx. New LlamaError::VisionLoad.
+Shim: reuses binding_state ctx + make_sampler; mtmd_helper_eval_chunks + greedy gen; on legacy-chat-template fail wraps gemma turn structure (<start_of_turn>...). build.rs: -DLLAMA_BUILD_MTMD=ON, build_target mtmd, link [mtmd,llama,ggml,ggml-cpu,ggml-base], +tools/mtmd include.
+
+=== rs-llama.cpp PORT FUNCTIONALLY COMPLETE + VERIFIED (text phi-4, vision gemma) ===
+Remaining: final whole-branch review (risk surface: streaming transmute soundness, mtmd C++ shim mem/error, FFI) → fixes → M5 docs/LICENSE/CI → PUBLISH to inovacc/rs-llama.cpp (needs USER CONFIRM — outward action). Then Deliverable 2 (capture_describer app).
+
+FINAL REVIEW done (opus): verdict FIX-BEFORE-SHIP, 1 Critical. All flagged must-checks verified SOUND (transmute, mtmd frees, registry keying, Send/Sync, resize-retry).
+  C-1 CRITICAL: Model::tokenize with opts.tokens<=0 (public i32) → Rust makes 0-len buffer but C writes full token count → heap OOB from safe Rust. Fix: clamp tokens<=0 → 4096 (also fixes predict negative→128 minor). model.rs:378-405 + binding.cpp:444-458.
+  Minors folded into fix: null-check mtmd_input_chunks_init (binding.cpp:577); untrack Cargo.lock (git rm --cached; honors .gitignore).
+  Minors left (documented, not worth churn): (int)out.size() truncation near 2GB (binding.cpp:413,639) — spurious error only, no UB.
