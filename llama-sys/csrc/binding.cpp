@@ -10,6 +10,8 @@
 
 #include "binding.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <cstdint>
 #include <cstring>
@@ -480,6 +482,167 @@ int load_state(void *ctx, char *statefile, char *modes) {
 
 void save_state(void *ctx, char *dst, char *modes) {
     (void)ctx; (void)dst; (void)modes;
+}
+
+// ---- mtmd (multimodal vision) ----------------------------------------------
+
+void *mtmd_load(void *state, const char *mmproj_path) {
+    binding_state *st = static_cast<binding_state *>(state);
+    if (st == nullptr || st->model == nullptr || mmproj_path == nullptr) {
+        return nullptr;
+    }
+    mtmd_context_params mp = mtmd_context_params_default();
+    mp.use_gpu       = false; // CPU-only build
+    mp.print_timings = false;
+    mp.n_threads     = 0;     // let mtmd choose
+    mtmd_context *mctx = mtmd_init_from_file(mmproj_path, st->model, mp);
+    if (mctx == nullptr) {
+        return nullptr;
+    }
+    // Only vision is supported by this wrapper; reject audio-only projectors.
+    if (!mtmd_support_vision(mctx)) {
+        mtmd_free(mctx);
+        return nullptr;
+    }
+    return mctx;
+}
+
+int mtmd_describe(void *mtmd_ctx, void *state, const char *image_path,
+                  const char *prompt, char *result, int result_size, int *n_tokens) {
+    if (n_tokens != nullptr) {
+        *n_tokens = 0;
+    }
+    mtmd_context *mctx = static_cast<mtmd_context *>(mtmd_ctx);
+    binding_state *st  = static_cast<binding_state *>(state);
+    if (mctx == nullptr || st == nullptr || st->ctx == nullptr || st->model == nullptr ||
+        image_path == nullptr || result == nullptr || result_size <= 0) {
+        return -1;
+    }
+
+    // Fresh context: clear any prior KV state, restart positions at 0.
+    llama_memory_clear(llama_get_memory(st->ctx), true);
+    st->n_past = 0;
+
+    // Build the user turn: the media marker (so mtmd knows where to splice the
+    // image chunk) followed by the prompt. Run it through the model's chat
+    // template when present, otherwise use the raw marker+prompt string.
+    const char *marker = mtmd_get_marker(mctx);
+    if (marker == nullptr) {
+        marker = mtmd_default_marker();
+    }
+    std::string user_content = std::string(marker) + "\n" + (prompt ? std::string(prompt) : std::string());
+
+    std::string formatted;
+    const char *tmpl = llama_model_chat_template(st->model, nullptr);
+    if (tmpl != nullptr) {
+        llama_chat_message msg;
+        msg.role    = "user";
+        msg.content = user_content.c_str();
+        std::vector<char> buf(user_content.size() + 512);
+        int32_t need = llama_chat_apply_template(tmpl, &msg, 1, /*add_ass*/ true,
+                                                 buf.data(), (int32_t)buf.size());
+        if (need > (int32_t)buf.size()) {
+            buf.resize((size_t)need + 1);
+            need = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t)buf.size());
+        }
+        if (need > 0) {
+            formatted.assign(buf.data(), (size_t)need);
+        }
+    }
+    if (formatted.empty()) {
+        // The legacy (non-Jinja) llama_chat_apply_template only recognizes a
+        // fixed set of built-in templates; a model shipping a complex Jinja
+        // chat template (e.g. gemma's function-calling template) is not
+        // rendered here (we deliberately don't link libcommon/minja). Without
+        // an assistant turn opener the instruct model emits EOS immediately,
+        // so wrap the content in the gemma-family turn structure (parsed as
+        // special tokens by mtmd_tokenize with parse_special=true). This is the
+        // turn format used by every gemma vision model targeted by mtmd.
+        formatted = "<start_of_turn>user\n" + user_content +
+                    "<end_of_turn>\n<start_of_turn>model\n";
+    }
+
+    // Load + decode the image file into an mtmd bitmap.
+    mtmd_helper_bitmap_wrapper bm = mtmd_helper_bitmap_init_from_file(mctx, image_path, false);
+    if (bm.bitmap == nullptr) {
+        return -2;
+    }
+
+    mtmd_input_text text;
+    text.text          = formatted.c_str();
+    text.text_len      = formatted.size();
+    text.add_special   = true;
+    text.parse_special = true;
+
+    mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap *bitmaps[1] = { bm.bitmap };
+    int32_t trc = mtmd_tokenize(mctx, chunks, &text, bitmaps, 1);
+    if (trc != 0) {
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(bm.bitmap);
+        return -3;
+    }
+
+    // Evaluate text + image chunks into the llama context (encode image,
+    // decode everything), advancing n_past.
+    llama_pos new_n_past = 0;
+    int32_t erc = mtmd_helper_eval_chunks(mctx, st->ctx, chunks, /*n_past*/ 0,
+                                          /*seq_id*/ 0, /*n_batch*/ 512,
+                                          /*logits_last*/ true, &new_n_past);
+    mtmd_input_chunks_free(chunks);
+    mtmd_bitmap_free(bm.bitmap);
+    if (erc != 0) {
+        return -4;
+    }
+    st->n_past = (int)new_n_past;
+
+    // Sampling: reuse the shim's sampler builder. Greedy (temp<=0) for a
+    // stable, reproducible description.
+    binding_params bp;
+    bp.temp      = 0.0f;
+    bp.n_predict = 256;
+    llama_sampler *smpl = make_sampler(&bp, st->vocab);
+    if (smpl == nullptr) {
+        return -5;
+    }
+
+    std::string out;
+    int nt = 0;
+    const int n_ctx = (int)llama_n_ctx(st->ctx);
+    for (int i = 0; i < bp.n_predict && st->n_past < n_ctx; i++) {
+        llama_token id = llama_sampler_sample(smpl, st->ctx, -1);
+        if (llama_vocab_is_eog(st->vocab, id)) {
+            break;
+        }
+        out += token_to_piece(st->vocab, id);
+        nt++;
+        llama_batch b = llama_batch_get_one(&id, 1);
+        if (llama_decode(st->ctx, b) != 0) {
+            break;
+        }
+        st->n_past++;
+    }
+    llama_sampler_free(smpl);
+
+    if (n_tokens != nullptr) {
+        *n_tokens = nt;
+    }
+
+    // Resize-retry contract, identical to llama_predict_full: write up to
+    // result_size-1 bytes (NUL-terminated), return the FULL length.
+    size_t w = out.size();
+    if (w > (size_t)result_size - 1) {
+        w = (size_t)result_size - 1;
+    }
+    std::memcpy(result, out.data(), w);
+    result[w] = '\0';
+    return (int)out.size();
+}
+
+void mtmd_free_ctx(void *mtmd_ctx) {
+    if (mtmd_ctx != nullptr) {
+        mtmd_free(static_cast<mtmd_context *>(mtmd_ctx));
+    }
 }
 
 } // extern "C"

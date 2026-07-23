@@ -24,10 +24,18 @@ fn main() {
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("LLAMA_CURL", "OFF")
-        // Build ONLY the llama static lib (which transitively builds ggml,
-        // ggml-base, ggml-cpu). Avoids the common/app/server targets that need
-        // generated headers (build-info.h) we don't use.
-        .build_target("llama")
+        // Build the mtmd (multimodal/vision) library standalone — without
+        // pulling in the rest of the tools/ tree. This hook in llama.cpp's
+        // CMakeLists fires only when LLAMA_BUILD_TOOLS is OFF, adding just
+        // `tools/mtmd` (which bundles clip + mtmd-helper into one archive).
+        .define("LLAMA_BUILD_MTMD", "ON")
+        // mtmd's video helper only needs ffmpeg at RUNTIME, but disable it to
+        // keep the static build minimal.
+        .define("MTMD_VIDEO", "OFF")
+        // Build the mtmd static lib. mtmd depends on `llama` (which
+        // transitively builds ggml, ggml-base, ggml-cpu), so this one target
+        // pulls in everything the text side needed plus mtmd itself.
+        .build_target("mtmd")
         .build();
 
     // ---- 2. Collect the static archives the build produced. ----
@@ -39,8 +47,10 @@ fn main() {
     collect_archives(&dst.join("build"), &mut found);
 
     // GNU ld is single-pass: dependents before dependencies.
-    // shim -> llama -> ggml -> ggml-cpu -> ggml-base.
-    let ordered = ["llama", "ggml", "ggml-cpu", "ggml-base"];
+    // shim -> mtmd -> llama -> ggml -> ggml-cpu -> ggml-base.
+    // (mtmd bundles clip + mtmd-helper; it depends on llama+ggml so it must
+    // come BEFORE llama in the link line.)
+    let ordered = ["mtmd", "llama", "ggml", "ggml-cpu", "ggml-base"];
     for name in ordered {
         let src = found.get(name).unwrap_or_else(|| {
             let keys: Vec<_> = found.keys().collect();
@@ -65,6 +75,7 @@ fn main() {
         .std("c++17")
         .include(llama_src.join("include"))
         .include(llama_src.join("ggml/include"))
+        .include(llama_src.join("tools/mtmd")) // mtmd.h + mtmd-helper.h
         .include(manifest.join("csrc"))
         .file(manifest.join("csrc/binding.cpp"))
         .compile("llama_binding");

@@ -148,6 +148,21 @@ extern "C" {
         result: *mut c_char,
         result_size: c_int,
     ) -> c_int;
+
+    // ---- mtmd (multimodal vision) ----
+    pub fn mtmd_load(state: *mut c_void, mmproj_path: *const c_char) -> *mut c_void;
+
+    pub fn mtmd_describe(
+        mtmd_ctx: *mut c_void,
+        state: *mut c_void,
+        image_path: *const c_char,
+        prompt: *const c_char,
+        result: *mut c_char,
+        result_size: c_int,
+        n_tokens: *mut c_int,
+    ) -> c_int;
+
+    pub fn mtmd_free_ctx(mtmd_ctx: *mut c_void);
 }
 
 /// Forces the linker to retain the C shim (and therefore resolve every
@@ -170,5 +185,8 @@ pub fn _link_probe() -> usize {
     n += get_embeddings as *const () as usize;
     n += get_token_embeddings as *const () as usize;
     n += speculative_sampling as *const () as usize;
+    n += mtmd_load as *const () as usize;
+    n += mtmd_describe as *const () as usize;
+    n += mtmd_free_ctx as *const () as usize;
     n
 }

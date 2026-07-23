@@ -71,6 +71,27 @@ int llama_predict_full(void* params_ptr, void* state_pr, char* result, int resul
 // If the model has no template, returns 0 (caller should fall back to raw).
 int apply_chat_template(void* state_pr, const char* system, const char* user, char* result, int result_size);
 
+// ---- mtmd (multimodal vision) ----------------------------------------------
+// mtmd_load initializes an mtmd (vision) context from `mmproj_path`, using the
+// text model held by the shim `state` as the language backbone. Returns an
+// opaque `mtmd_context*` (as void*) or NULL on failure / if the model has no
+// vision support.
+void* mtmd_load(void* state, const char* mmproj_path);
+
+// mtmd_describe evaluates the image at `image_path` together with `prompt`
+// through the mtmd context and the shim's existing llama context, then runs
+// the shim's sampling loop to produce a textual description. It writes up to
+// result_size-1 bytes (NUL-terminated) into `result`, sets *n_tokens to the
+// number of tokens generated, and returns the FULL generated length in bytes
+// (may exceed result_size-1 → caller should grow the buffer and retry), or a
+// negative value on error.
+int mtmd_describe(void* mtmd_ctx, void* state, const char* image_path,
+                  const char* prompt, char* result, int result_size, int* n_tokens);
+
+// mtmd_free_ctx frees an mtmd context returned by mtmd_load. Named distinctly
+// from llama.cpp's own `mtmd_free` symbol to avoid a link-time clash.
+void mtmd_free_ctx(void* mtmd_ctx);
+
 #ifdef __cplusplus
 }
 
