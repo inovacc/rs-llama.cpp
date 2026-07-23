@@ -19,13 +19,14 @@ use std::sync::Mutex;
 
 use llama_sys::{
     apply_chat_template, llama_allocate_params, llama_binding_free_model, llama_free_params,
-    llama_predict_full, llama_tokenize_string, load_model,
+    llama_predict_full, llama_tokenize_string, load_model, mtmd_describe, mtmd_load,
 };
 
 use crate::error::{LlamaError, Result};
 use crate::logit_bias;
 use crate::options::{ModelOptions, PredictOptions};
 use crate::stream::Filter;
+use crate::vision::VisionModel;
 
 /// Newtype around the raw trait-object pointer stored in the registry.
 /// `*mut dyn FnMut(&str) -> bool` is not `Send`/`Sync` by default (it is a
@@ -648,6 +649,110 @@ impl Model {
         Err(LlamaError::Inference)
     }
 
+    /// Loads a multimodal projector (`mmproj` GGUF) at `mmproj_path` on top of
+    /// this model, returning a [`VisionModel`] that can be used with
+    /// [`Model::describe_image`].
+    ///
+    /// This is the ADDITIVE vision surface (the text side has no analogue in
+    /// go-llama.cpp). The returned `VisionModel` internally references this
+    /// `Model`'s `llama_model`/`llama_context`, so **this `Model` must outlive
+    /// the returned `VisionModel`** and every `describe_image` call must pass
+    /// the same `Model` (see [`VisionModel`]'s safety notes).
+    ///
+    /// Returns `Err(LlamaError::VisionLoad)` if the projector cannot be loaded,
+    /// if the model has no vision support, or if `mmproj_path` contains an
+    /// embedded NUL.
+    pub fn load_mmproj(&self, mmproj_path: &str) -> Result<VisionModel> {
+        let c_path = CString::new(mmproj_path).map_err(|_| LlamaError::VisionLoad)?;
+        // SAFETY: `self.ptr` is a live shim `binding_state*` owned by this
+        // `Model`; `c_path` outlives the call. `mtmd_load` copies what it
+        // needs and does not retain the path pointer.
+        let ctx = unsafe { mtmd_load(self.ptr, c_path.as_ptr()) };
+        if ctx.is_null() {
+            return Err(LlamaError::VisionLoad);
+        }
+        // SAFETY: `ctx` is a non-null `mtmd_context*` freshly returned by
+        // `mtmd_load` and owned exclusively by the new `VisionModel`.
+        Ok(unsafe { VisionModel::from_raw(ctx) })
+    }
+
+    /// Describes the image at `image_path` using `vision` (loaded via
+    /// [`Model::load_mmproj`] from this same `Model`) and the text `prompt`.
+    ///
+    /// Runs the mtmd evaluate + sampling flow in the C shim (image encode →
+    /// chunk eval into the llama context → greedy generation), returning the
+    /// generated description. Implements the same resize-retry contract as
+    /// [`Model::predict`]: the FFI returns the FULL length, and the buffer is
+    /// grown to `length + 1` and the call retried exactly once if the initial
+    /// buffer was too small.
+    ///
+    /// # Safety requirement
+    /// `vision` must have been created from `self` via [`Model::load_mmproj`];
+    /// passing a `VisionModel` from a different `Model` is undefined behavior.
+    ///
+    /// Maps a negative FFI return to `Err(LlamaError::Inference)`.
+    pub fn describe_image(
+        &self,
+        vision: &VisionModel,
+        image_path: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let c_image = CString::new(image_path).map_err(|_| LlamaError::Inference)?;
+        let c_prompt = CString::new(prompt).map_err(|_| LlamaError::Inference)?;
+
+        const INITIAL_SIZE: usize = 8192;
+        let (full_len, buf) =
+            self.describe_once(vision, &c_image, &c_prompt, INITIAL_SIZE)?;
+        if full_len < INITIAL_SIZE {
+            return Ok(decode_nul_terminated(&buf, full_len));
+        }
+
+        let retry_size = full_len.checked_add(1).ok_or(LlamaError::OutOfMemory)?;
+        let (full_len, buf) =
+            self.describe_once(vision, &c_image, &c_prompt, retry_size)?;
+        if full_len >= retry_size {
+            return Err(LlamaError::Inference);
+        }
+        Ok(decode_nul_terminated(&buf, full_len))
+    }
+
+    /// Single `mtmd_describe` call into a freshly allocated `size`-byte buffer.
+    /// Returns the FFI's reported FULL length alongside the buffer.
+    fn describe_once(
+        &self,
+        vision: &VisionModel,
+        c_image: &CStr,
+        c_prompt: &CStr,
+        size: usize,
+    ) -> Result<(usize, Vec<u8>)> {
+        if size == 0 || size > i32::MAX as usize {
+            return Err(LlamaError::OutOfMemory);
+        }
+        let mut buf: Vec<u8> = vec![0u8; size];
+        let mut n_tokens: c_int = 0;
+
+        // SAFETY: `buf` has `size` bytes, passed as `result_size`;
+        // `mtmd_describe` never writes past `result_size - 1` plus a NUL.
+        // `vision.ctx` and `self.ptr` are both live and originate from this
+        // same `Model` (per the documented safety requirement). The CStrs
+        // outlive the call.
+        let full_len = unsafe {
+            mtmd_describe(
+                vision.ctx,
+                self.ptr,
+                c_image.as_ptr(),
+                c_prompt.as_ptr(),
+                buf.as_mut_ptr() as *mut c_char,
+                size as c_int,
+                &mut n_tokens,
+            )
+        };
+        if full_len < 0 {
+            return Err(LlamaError::Inference);
+        }
+        Ok((full_len as usize, buf))
+    }
+
     /// Restores a previously saved context state. Not yet implemented on
     /// the C shim; mirrors Go's `LoadState` (`llama.go` lines 113-119).
     pub fn load_state(&mut self, _state: &str) -> Result<()> {
@@ -849,6 +954,46 @@ mod tests {
 
         assert!(count <= N);
         assert!(!result.is_empty());
+    }
+
+    /// Loads the vision GGUF named by `LLAMA_TEST_VISION_MODEL`, or returns
+    /// `None` to skip. Separate from `test_model()` because a vision model +
+    /// projector are only present when explicitly configured.
+    fn test_vision_model() -> Option<Model> {
+        let path = std::env::var("LLAMA_TEST_VISION_MODEL").ok()?;
+        Some(
+            Model::load(&path, &ModelOptions::default())
+                .expect("failed to load LLAMA_TEST_VISION_MODEL"),
+        )
+    }
+
+    #[test]
+    fn describe_image_yields_nonempty_description() {
+        let Some(model) = test_vision_model() else {
+            eprintln!(
+                "skipping describe_image_yields_nonempty_description: LLAMA_TEST_VISION_MODEL not set"
+            );
+            return;
+        };
+        let Ok(mmproj) = std::env::var("LLAMA_TEST_MMPROJ") else {
+            eprintln!(
+                "skipping describe_image_yields_nonempty_description: LLAMA_TEST_MMPROJ not set"
+            );
+            return;
+        };
+        // Default to the committed fixture; allow override via env.
+        let image = std::env::var("LLAMA_TEST_IMAGE").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/red_circle.png").to_string()
+        });
+
+        let vision = model
+            .load_mmproj(&mmproj)
+            .expect("load_mmproj failed (mmproj load / no vision support)");
+        let desc = model
+            .describe_image(&vision, &image, "Describe this image in one sentence.")
+            .expect("describe_image failed");
+        eprintln!("describe_image => {desc:?}");
+        assert!(!desc.trim().is_empty(), "description was empty");
     }
 
     #[test]

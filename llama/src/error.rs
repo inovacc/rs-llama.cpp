@@ -14,6 +14,8 @@ pub enum LlamaError {
     EmbeddingsDisabled,
     #[error("llama: not implemented")]
     NotImplemented,
+    #[error("llama: failed to load multimodal projector (mmproj)")]
+    VisionLoad,
 }
 
 pub type Result<T> = std::result::Result<T, LlamaError>;
