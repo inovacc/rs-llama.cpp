@@ -5,3 +5,7 @@ edition = "2021"
 license = "BSD-3-Clause"
 links = "llama_binding"
 build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
