@@ -206,6 +206,56 @@ pub fn write_gguf(kvs: &[KvPair], tensors: &[TestTensor]) -> PathBuf {
     path
 }
 
+/// Builds an n-block llama-arch GGUF fixture with known sizes, for
+/// `estimate.rs` tests (Go's `sampleLlamaModel`).
+///
+/// Each block has one F32 weight tensor of shape `[64,16]` =>
+/// `64*16*4 = 4096` bytes. The output tensor is `[64,16]` => 4096 bytes.
+/// `token_embd` is present (tied). Metadata uses tiny dims so graph/KV are
+/// hand-computable in `estimate.rs` tests:
+/// `embedding=64 head_count=8 head_count_kv=8 key_length=8 value_length=8
+/// vocab=128`.
+///
+/// Tensor data is left empty: `num_bytes()` comes from shape, and the
+/// estimator never reads tensor data, so the file stays tiny.
+pub fn sample_llama_model(n: usize) -> PathBuf {
+    let kvs = vec![
+        KvPair::str("general.architecture", "llama"),
+        KvPair::str("general.name", "tiny-llama-fixture"),
+        KvPair::u32("llama.block_count", n as u32),
+        KvPair::u32("llama.embedding_length", 64),
+        KvPair::u32("llama.attention.head_count", 8),
+        KvPair::u32("llama.attention.head_count_kv", 8),
+        KvPair::u32("llama.attention.key_length", 8),
+        KvPair::u32("llama.attention.value_length", 8),
+        KvPair::u32("llama.vocab_size", 128),
+    ];
+
+    let mut tensors = Vec::with_capacity(n + 2);
+    for i in 0..n {
+        tensors.push(TestTensor {
+            name: format!("blk.{i}.attn.weight"),
+            tensor_type: 0, // F32
+            shape: vec![64, 16],
+            data: Vec::new(),
+        });
+    }
+    tensors.push(TestTensor {
+        name: "token_embd.weight".into(),
+        tensor_type: 0,
+        shape: vec![128, 64],
+        data: Vec::new(),
+    });
+    tensors.push(TestTensor {
+        name: "output.weight".into(),
+        tensor_type: 0,
+        shape: vec![64, 16],
+        data: Vec::new(),
+    });
+
+    write_gguf(&kvs, &tensors)
+}
+
 /// Builds a small llama-arch GGUF fixture used across gguf parser tests
 /// (Go's `sampleModel`).
 pub fn sample_model() -> PathBuf {
