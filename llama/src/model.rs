@@ -11,9 +11,11 @@
 //! end-to-end smoke test are handled by separate work items and are not part
 //! of this module.
 
-use std::ffi::CString;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Mutex;
 
 use llama_sys::{
     apply_chat_template, llama_allocate_params, llama_binding_free_model, llama_free_params,
@@ -23,6 +25,74 @@ use llama_sys::{
 use crate::error::{LlamaError, Result};
 use crate::logit_bias;
 use crate::options::{ModelOptions, PredictOptions};
+use crate::stream::Filter;
+
+/// Newtype around the raw trait-object pointer stored in the registry.
+/// `*mut dyn FnMut(&str) -> bool` is not `Send`/`Sync` by default (it is a
+/// raw pointer to a foreign, possibly-!Send closure); this wrapper asserts
+/// the invariant documented on [`CALLBACKS`] so `Mutex<HashMap<_, RawCb>>`
+/// itself is `Sync` and usable in a `static`.
+#[derive(Clone, Copy)]
+struct RawCb(*mut (dyn FnMut(&str) -> bool + 'static));
+
+// SAFETY: the pointee is only ever dereferenced from within `tokenCallback`,
+// which runs synchronously on the same thread that is inside the blocking
+// `Model::predict_stream` / `llama_predict_full` call that registered it
+// (llama.cpp's generation loop is single-threaded w.r.t. one context), so no
+// cross-thread access to the pointee ever actually occurs even though the
+// pointer value itself is moved between the registering thread and the
+// (identical) callback thread while under the `Mutex`.
+unsafe impl Send for RawCb {}
+// SAFETY: see above; the `Mutex` additionally serializes all access to the
+// map holding these pointers.
+unsafe impl Sync for RawCb {}
+
+/// Global registry of per-context streaming callbacks, mirroring Go's
+/// `callbacks map[uintptr]func(string) bool` in `llama.go` (lines 445-473).
+/// Keyed by the `binding_state*` pointer (as `usize`) so the C-called
+/// `tokenCallback` can recover the right Rust closure for the context that
+/// is currently generating.
+///
+/// The registry stores a raw pointer to a `dyn FnMut(&str) -> bool` that is
+/// owned by the stack frame of `Model::predict_stream` for the duration of
+/// the call (never by the registry itself) — `register_callback`/
+/// `unregister_callback` are always paired via `CallbackGuard` so the entry
+/// never outlives the closure it points at.
+static CALLBACKS: Mutex<Option<HashMap<usize, RawCb>>> = Mutex::new(None);
+
+/// Registers `callback` for `state`, mirroring Go's `setCallback`.
+///
+/// # Safety
+/// `callback` must remain valid (i.e. the pointee must not move or be
+/// dropped) for as long as it stays registered. Callers must pair this with
+/// [`unregister_callback`] before the referent is dropped — `CallbackGuard`
+/// does this automatically.
+unsafe fn register_callback(state: *mut c_void, callback: *mut (dyn FnMut(&str) -> bool + 'static)) {
+    let mut guard = CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(state as usize, RawCb(callback));
+}
+
+/// Removes the callback registered for `state`, mirroring Go's
+/// `setCallback(state, nil)`.
+fn unregister_callback(state: *mut c_void) {
+    let mut guard = CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(&(state as usize));
+    }
+}
+
+/// RAII guard that unregisters a context's streaming callback on drop, even
+/// if generation returns early via `?` — mirrors Go's `defer
+/// setCallback(l.state, prev)` in `Predict`/`PredictResult`.
+struct CallbackGuard {
+    state: *mut c_void,
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        unregister_callback(self.state);
+    }
+}
 
 /// Definition of the `tokenCallback` symbol the C shim CALLS during
 /// generation (declared, not defined, in `llama_sys`; see that crate's doc
@@ -30,13 +100,38 @@ use crate::options::{ModelOptions, PredictOptions};
 /// `binding.cpp` (i.e. `llama_predict`/`llama_predict_full`) requires this
 /// symbol to be resolvable.
 ///
-/// This is a placeholder that always returns "continue" (`1`) — real
-/// per-token streaming dispatch (registering/looking up a Rust callback by
-/// state pointer, mirroring Go's `callbacks` map in `llama.go`) is a
-/// separate work item (Task 3.4) and is not implemented here.
+/// Recovers the Rust callback registered for `state` (via
+/// `Model::predict_stream`) from the global `CALLBACKS` registry and invokes
+/// it with the decoded token piece, mirroring Go's `tokenCallback`
+/// (`llama.go` lines 450-460): if no callback is registered for `state`,
+/// generation is allowed to continue (returns 1), matching Go's `return
+/// true` fallthrough. Returns `1` to continue, `0` to stop, matching the C
+/// shim's `unsigned char` contract (Go: `true`/`false`).
 #[no_mangle]
-pub extern "C" fn tokenCallback(_state: *mut c_void, _token: *mut c_char) -> u8 {
-    1
+pub extern "C" fn tokenCallback(state: *mut c_void, token: *mut c_char) -> u8 {
+    // SAFETY: `token` is a NUL-terminated buffer written by `generate()` in
+    // binding.cpp (`buf.push_back('\0')` before the call) and is valid for
+    // the duration of this call.
+    let piece = unsafe { CStr::from_ptr(token) }.to_string_lossy();
+
+    let guard = CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    let cb_ptr = match guard.as_ref().and_then(|m| m.get(&(state as usize))) {
+        Some(p) => p.0,
+        None => return 1,
+    };
+    drop(guard);
+
+    // SAFETY: `cb_ptr` was registered by `Model::predict_stream`, which
+    // keeps the referent alive (on its own stack frame) and unregisters it
+    // via `CallbackGuard` before returning; since `tokenCallback` is only
+    // ever invoked synchronously from within that same still-running call,
+    // the pointee is guaranteed live here.
+    let cb: &mut dyn FnMut(&str) -> bool = unsafe { &mut *cb_ptr };
+    if cb(&piece) {
+        1
+    } else {
+        0
+    }
 }
 
 /// A loaded llama.cpp model + inference context.
@@ -124,14 +219,22 @@ impl Model {
     /// `PredictResult` use 99_999_999) before it ever reaches this shared
     /// shape.
     ///
-    /// Unlike `Predict`/`PredictResult` in Go (which pass a null antiprompt
-    /// array because stop-sequence detection happens in the Go-side
-    /// streaming sink — out of scope here, see the module doc comment),
-    /// this helper always marshals `opts.stop_prompts` into the C
-    /// `antiprompt` array, matching Go's `Eval` call site. Streaming/stop
-    /// filtering is a separate work item; until it lands, the C side simply
-    /// receives the real antiprompt list it was designed to accept.
-    fn allocate_params(&self, prompt: &str, opts: &PredictOptions, n_predict: i32) -> Result<ParamsGuard> {
+    /// `pass_antiprompt` selects which of Go's two marshalling shapes to
+    /// reproduce:
+    /// - `true` — marshal `opts.stop_prompts` into the C `antiprompt` array,
+    ///   matching Go's `Eval`/`TokenizeString` call sites (`llama.go` lines
+    ///   178, 398), which have no Rust-side stop filter of their own.
+    /// - `false` — pass `nil, 0` for the antiprompt array, matching Go's
+    ///   `Predict`/`PredictResult` (`llama.go` lines 260, 324): stop
+    ///   detection instead happens Rust-side via `stream::Filter`, so the C
+    ///   antiprompt scan is redundant and skipped, mirroring Go exactly.
+    fn allocate_params(
+        &self,
+        prompt: &str,
+        opts: &PredictOptions,
+        n_predict: i32,
+        pass_antiprompt: bool,
+    ) -> Result<ParamsGuard> {
         let c_prompt = CString::new(prompt).map_err(|_| LlamaError::Inference)?;
         let c_path_prompt_cache =
             CString::new(opts.path_prompt_cache.as_str()).map_err(|_| LlamaError::Inference)?;
@@ -143,7 +246,12 @@ impl Model {
             CString::new(opts.negative_prompt.as_str()).map_err(|_| LlamaError::Inference)?;
 
         // Antiprompt array: `opts.stop_prompts` -> Vec<CString> (kept alive by
-        // the guard) -> Vec<*const c_char> passed as `const char **`.
+        // the guard) -> Vec<*const c_char> passed as `const char **`. When
+        // `pass_antiprompt` is false (the streaming/predict path), Go passes
+        // `nil, 0` instead (see the `allocate_params` doc comment above), so
+        // the CStrings/pointers are still built (kept in the guard for
+        // lifetime uniformity) but the pointer/count handed to the FFI are
+        // forced to null/0.
         let antiprompt_cstrings: Vec<CString> = opts
             .stop_prompts
             .iter()
@@ -152,11 +260,12 @@ impl Model {
             .map_err(|_| LlamaError::Inference)?;
         let mut antiprompt_ptrs: Vec<*const c_char> =
             antiprompt_cstrings.iter().map(|c| c.as_ptr()).collect();
-        let antiprompt_count = antiprompt_ptrs.len() as c_int;
-        let antiprompt_arg: *mut *const c_char = if antiprompt_ptrs.is_empty() {
-            ptr::null_mut()
+        let (antiprompt_arg, antiprompt_count): (*mut *const c_char, c_int) = if !pass_antiprompt
+            || antiprompt_ptrs.is_empty()
+        {
+            (ptr::null_mut(), 0)
         } else {
-            antiprompt_ptrs.as_mut_ptr()
+            (antiprompt_ptrs.as_mut_ptr(), antiprompt_ptrs.len() as c_int)
         };
 
         // Logit bias: parse "<token>:<bias>,..."; a malformed spec is logged
@@ -260,7 +369,11 @@ impl Model {
     /// `Err(LlamaError::Inference)`.
     pub fn tokenize(&self, text: &str, opts: &PredictOptions) -> Result<Vec<i32>> {
         let effective_tokens = if opts.tokens == 0 { 4096 } else { opts.tokens };
-        let guard = self.allocate_params(text, opts, effective_tokens)?;
+        // Matches Go's `TokenizeString` (`llama.go` line 398): the real
+        // antiprompt list is not marshalled there either (it passes a nil
+        // double-pointer), so `pass_antiprompt = false` here reproduces that
+        // exactly (equivalent in effect to Go's fakeDblPtr/0 pair).
+        let guard = self.allocate_params(text, opts, effective_tokens, false)?;
 
         let cap = effective_tokens.max(0) as usize;
         let mut buf: Vec<c_int> = vec![0; cap];
@@ -301,7 +414,13 @@ impl Model {
     /// unbounded allocation).
     pub fn predict(&self, prompt: &str, opts: &PredictOptions) -> Result<String> {
         let effective_tokens = if opts.tokens == 0 { 99_999_999 } else { opts.tokens };
-        let guard = self.allocate_params(prompt, opts, effective_tokens)?;
+        // Matches Go's `Predict`/`PredictResult` (`llama.go` lines 260, 324):
+        // both pass `nil, 0` for the antiprompt array because stop-sequence
+        // detection happens Go-side via the filtering sink, not in C. This
+        // non-streaming `predict` has no Rust-side stop filter of its own
+        // (it returns the model's full, unfiltered output), but antiprompt
+        // parity with Go is kept regardless per the task's requirement.
+        let guard = self.allocate_params(prompt, opts, effective_tokens, false)?;
 
         const INITIAL_SIZE: usize = 8192;
         let (full_len, buf) = self.predict_full_once(&guard, INITIAL_SIZE, opts.debug_mode)?;
@@ -358,6 +477,120 @@ impl Model {
             return Err(LlamaError::Inference);
         }
         Ok((full_len as usize, buf))
+    }
+
+    /// Generates a completion for `prompt` while streaming decoded pieces to
+    /// `on_token` as they arrive. Mirrors Go's `Predict` +
+    /// `SetTokenCallback`/`tokenCallback` combination (`llama.go` lines
+    /// 207-282, 450-460):
+    ///
+    /// - Stop-sequence detection happens Rust-side via `stream::Filter`
+    ///   (built from `opts.stop_prompts`), so `allocate_params` is called
+    ///   with `pass_antiprompt = false` — matching Go's `nil, 0` antiprompt
+    ///   array on this call site.
+    /// - Each decoded piece the C shim reports (via the global `tokenCallback`
+    ///   dispatch) is pushed through the `Filter`; text the filter deems
+    ///   safe to emit is forwarded to `on_token` and appended to the
+    ///   accumulated result. When the filter reports a stop match, `on_token`
+    ///   is not called again and generation is signalled to stop.
+    /// - `on_token` returning `false` (Go: "the predictor will return")
+    ///   stops generation early, exactly like Go's callback contract.
+    /// - The callback is registered/unregistered via `CallbackGuard`, which
+    ///   unregisters on every exit path (including early return via `?`),
+    ///   mirroring Go's `defer setCallback(l.state, prev)`.
+    ///
+    /// Returns the accumulated emitted text (post-filter, i.e. with any
+    /// matched stop sequence and everything after it excluded), or
+    /// `Err(LlamaError::Inference)` if the underlying FFI call fails.
+    pub fn predict_stream(
+        &self,
+        prompt: &str,
+        opts: &PredictOptions,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        let effective_tokens = if opts.tokens == 0 { 99_999_999 } else { opts.tokens };
+        let guard = self.allocate_params(prompt, opts, effective_tokens, false)?;
+
+        let mut filter = Filter::new(opts.stop_prompts.clone());
+        let mut accumulated = String::new();
+        let mut stopped = false;
+
+        // `dispatch` is what actually runs on the C callback thread (i.e.
+        // synchronously inside `llama_predict_full` below): it pushes the
+        // piece through `filter`, forwards any newly-safe-to-emit text to
+        // `on_token`, and returns whether generation should continue.
+        let mut dispatch = |piece: &str| -> bool {
+            if stopped {
+                return false;
+            }
+            let (emit, stop) = filter.push(piece);
+            if !emit.is_empty() {
+                accumulated.push_str(&emit);
+                if !on_token(&emit) {
+                    stopped = true;
+                    return false;
+                }
+            }
+            if stop {
+                stopped = true;
+                return false;
+            }
+            true
+        };
+
+        let trait_obj: &mut (dyn FnMut(&str) -> bool + 'static) =
+            // SAFETY: this reference is transmuted-by-cast to a raw pointer
+            // and registered below only for the duration of this function
+            // call; `CallbackGuard` unregisters it (via `state`) before
+            // `dispatch`'s stack frame (and hence `filter`/`accumulated`/
+            // `stopped`, which it borrows) goes out of scope. The lifetime
+            // erasure to `'static` is sound only because of that strict
+            // scoping, enforced by the guard running in `Drop` even on an
+            // early `?` return below.
+            unsafe { std::mem::transmute(&mut dispatch as &mut dyn FnMut(&str) -> bool) };
+        let cb_ptr: *mut (dyn FnMut(&str) -> bool + 'static) = trait_obj;
+
+        // SAFETY: `cb_ptr` points at `dispatch`, which outlives this whole
+        // function body (it is dropped only when the function returns); the
+        // `_guard` below unregisters the entry no later than that, and
+        // `self.ptr` is a live, exclusively-owned context pointer for the
+        // lifetime of `self`.
+        unsafe { register_callback(self.ptr, cb_ptr) };
+        let _guard = CallbackGuard { state: self.ptr };
+
+        const SCRATCH: usize = 32768;
+        let mut buf: Vec<u8> = vec![0u8; SCRATCH];
+        let mut n_tokens: c_int = 0;
+
+        // SAFETY: `buf` has `SCRATCH` bytes of capacity, which is also what
+        // is passed as `result_size`; the C result buffer's content is
+        // ignored (the accumulated, filtered text comes from `dispatch`
+        // instead), only the return code is checked. While this call runs,
+        // every generated piece flows through the global `tokenCallback`,
+        // which looks up and invokes `dispatch` via the registry entry
+        // registered just above.
+        let ret = unsafe {
+            llama_predict_full(
+                guard.ptr,
+                self.ptr,
+                buf.as_mut_ptr() as *mut c_char,
+                SCRATCH as c_int,
+                &mut n_tokens,
+                opts.debug_mode,
+            )
+        };
+
+        drop(_guard);
+
+        if ret < 0 {
+            return Err(LlamaError::Inference);
+        }
+
+        if !stopped {
+            accumulated.push_str(&filter.flush());
+        }
+
+        Ok(accumulated)
     }
 
     /// Formats `(system, user)` using the model's embedded GGUF chat
@@ -547,6 +780,68 @@ mod tests {
         };
         let out = model.predict("The capital of France is", &opts).expect("predict failed");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn predict_stream_matches_predict_up_to_stop() {
+        let Some(model) = test_model() else {
+            eprintln!("skipping predict_stream_matches_predict_up_to_stop: LLAMA_TEST_MODEL not set");
+            return;
+        };
+        let opts = PredictOptions {
+            temperature: 0.0,
+            seed: 1,
+            tokens: 32,
+            stop_prompts: vec!["\n".to_string()],
+            ..PredictOptions::default()
+        };
+
+        let non_streaming = model
+            .predict("The capital of France is", &opts)
+            .expect("predict failed");
+
+        let mut streamed = String::new();
+        let result = model
+            .predict_stream("The capital of France is", &opts, &mut |piece| {
+                streamed.push_str(piece);
+                true
+            })
+            .expect("predict_stream failed");
+
+        assert_eq!(result, streamed);
+        // The non-streaming path has no Rust-side stop filter, so it may run
+        // longer; the streamed (filtered, stopped) text must be a prefix of
+        // what the unfiltered model produced up to that point.
+        assert!(
+            non_streaming.starts_with(&streamed) || streamed.starts_with(&non_streaming),
+            "streamed={streamed:?} non_streaming={non_streaming:?}"
+        );
+    }
+
+    #[test]
+    fn predict_stream_callback_stops_generation_early() {
+        let Some(model) = test_model() else {
+            eprintln!("skipping predict_stream_callback_stops_generation_early: LLAMA_TEST_MODEL not set");
+            return;
+        };
+        let opts = PredictOptions {
+            temperature: 0.0,
+            seed: 1,
+            tokens: 64,
+            ..PredictOptions::default()
+        };
+
+        let mut count = 0usize;
+        const N: usize = 3;
+        let result = model
+            .predict_stream("The capital of France is", &opts, &mut |_piece| {
+                count += 1;
+                count < N
+            })
+            .expect("predict_stream failed");
+
+        assert!(count <= N);
+        assert!(!result.is_empty());
     }
 
     #[test]
