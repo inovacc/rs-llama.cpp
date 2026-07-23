@@ -3,6 +3,9 @@
 
 use super::filter::Filter;
 
+/// Per-token user callback: returns `false` to halt generation.
+type UserCallback<'a> = Box<dyn FnMut(&str) -> bool + 'a>;
+
 /// Sink routes each decoded token piece through a `Filter`: it forwards only
 /// safe-to-emit text to an optional user callback, accumulates the full
 /// filtered text for the caller's return value, and reports when generation
@@ -13,7 +16,7 @@ use super::filter::Filter;
 /// headless tests.
 pub struct Sink<'a> {
     f: Filter,
-    user: Option<Box<dyn FnMut(&str) -> bool + 'a>>,
+    user: Option<UserCallback<'a>>,
     buf: String,
 }
 
@@ -21,7 +24,7 @@ impl<'a> Sink<'a> {
     /// Returns a Sink that filters against stops and forwards emitted text to
     /// `user` (which may be `None`). Empty stops means no stop sequences —
     /// only incomplete-UTF-8 hold-back applies.
-    pub fn new(stops: Vec<String>, user: Option<Box<dyn FnMut(&str) -> bool + 'a>>) -> Self {
+    pub fn new(stops: Vec<String>, user: Option<UserCallback<'a>>) -> Self {
         Self {
             f: Filter::new(stops),
             user,

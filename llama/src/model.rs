@@ -107,8 +107,15 @@ impl Drop for CallbackGuard {
 /// generation is allowed to continue (returns 1), matching Go's `return
 /// true` fallthrough. Returns `1` to continue, `0` to stop, matching the C
 /// shim's `unsigned char` contract (Go: `true`/`false`).
+///
+/// # Safety
+///
+/// `token` must be a valid, NUL-terminated buffer for the duration of the
+/// call. This holds when invoked by the C shim (`binding.cpp`), which writes
+/// `buf.push_back('\0')` before calling; this function must never be called
+/// directly from Rust with an arbitrary pointer.
 #[no_mangle]
-pub extern "C" fn tokenCallback(state: *mut c_void, token: *mut c_char) -> u8 {
+pub unsafe extern "C" fn tokenCallback(state: *mut c_void, token: *mut c_char) -> u8 {
     // SAFETY: `token` is a NUL-terminated buffer written by `generate()` in
     // binding.cpp (`buf.push_back('\0')` before the call) and is valid for
     // the duration of this call.

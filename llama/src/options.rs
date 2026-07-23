@@ -6,6 +6,9 @@
 //! ..Default::default() }`) or simple builder methods, so no closure-based
 //! option types are ported here.
 
+/// Go's `TokenCallback func(string) bool`, invoked per generated token.
+pub type TokenCallback = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Options controlling how a model is loaded.
 ///
 /// Field-for-field port of Go's `ModelOptions` (`options.go` lines 3-22).
@@ -96,7 +99,7 @@ pub struct PredictOptions {
     pub penalize_nl: bool,
     pub logit_bias: String,
     /// Go's `TokenCallback func(string) bool`.
-    pub token_callback: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub token_callback: Option<TokenCallback>,
 
     pub path_prompt_cache: String,
     pub mlock: bool,
@@ -220,22 +223,22 @@ mod tests {
         let d = ModelOptions::default();
         assert_eq!(d.context_size, 512);
         assert_eq!(d.n_batch, 512);
-        assert_eq!(d.mmap, true);
+        assert!(d.mmap);
         assert_eq!(d.freq_rope_base, 10000.0);
         assert_eq!(d.freq_rope_scale, 1.0);
         assert_eq!(d.seed, 0);
-        assert_eq!(d.f16_memory, false);
-        assert_eq!(d.mlock, false);
-        assert_eq!(d.low_vram, false);
-        assert_eq!(d.embeddings, false);
-        assert_eq!(d.numa, false);
+        assert!(!d.f16_memory);
+        assert!(!d.mlock);
+        assert!(!d.low_vram);
+        assert!(!d.embeddings);
+        assert!(!d.numa);
         assert_eq!(d.n_gpu_layers, 0);
         assert_eq!(d.main_gpu, "");
         assert_eq!(d.tensor_split, "");
         assert_eq!(d.mul_mat_q, None);
         assert_eq!(d.lora_base, "");
         assert_eq!(d.lora_adapter, "");
-        assert_eq!(d.perplexity, false);
+        assert!(!d.perplexity);
     }
 
     #[test]
@@ -252,10 +255,10 @@ mod tests {
         assert_eq!(d.n_keep, 64);
         assert_eq!(d.top_p, 0.95);
         assert_eq!(d.n_draft, 0);
-        assert_eq!(d.f16_kv, false);
-        assert_eq!(d.debug_mode, false);
+        assert!(!d.f16_kv);
+        assert!(!d.debug_mode);
         assert!(d.stop_prompts.is_empty());
-        assert_eq!(d.ignore_eos, false);
+        assert!(!d.ignore_eos);
         assert_eq!(d.tail_free_sampling_z, 1.0);
         assert_eq!(d.typical_p, 1.0);
         assert_eq!(d.min_p, 0.0);
@@ -264,14 +267,14 @@ mod tests {
         assert_eq!(d.mirostat, 0);
         assert_eq!(d.mirostat_tau, 5.0);
         assert_eq!(d.mirostat_eta, 0.1);
-        assert_eq!(d.penalize_nl, false);
+        assert!(!d.penalize_nl);
         assert_eq!(d.logit_bias, "");
         assert!(d.token_callback.is_none());
         assert_eq!(d.path_prompt_cache, "");
-        assert_eq!(d.mlock, false);
-        assert_eq!(d.mmap, true);
-        assert_eq!(d.prompt_cache_all, false);
-        assert_eq!(d.prompt_cache_ro, false);
+        assert!(!d.mlock);
+        assert!(d.mmap);
+        assert!(!d.prompt_cache_all);
+        assert!(!d.prompt_cache_ro);
         assert_eq!(d.grammar, "");
         assert_eq!(d.main_gpu, "");
         assert_eq!(d.tensor_split, "");

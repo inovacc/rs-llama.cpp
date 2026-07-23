@@ -129,7 +129,7 @@ pub fn w_value(b: &mut Vec<u8>, v: &KvVal) {
 }
 
 fn align_up(n: u64, a: u64) -> u64 {
-    (n + a - 1) / a * a
+    n.div_ceil(a) * a
 }
 
 fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -188,7 +188,7 @@ pub fn write_gguf(kvs: &[KvPair], tensors: &[TestTensor]) -> PathBuf {
 
     let pad = (ALIGNMENT - (b.len() as u64) % ALIGNMENT) % ALIGNMENT;
     if pad > 0 {
-        b.extend(std::iter::repeat(0u8).take(pad as usize));
+        b.extend(std::iter::repeat_n(0u8, pad as usize));
     }
 
     let mut data = vec![0u8; data_len as usize];

@@ -15,6 +15,9 @@
 //! coroutine-style pull machinery.
 
 pub mod estimate;
+// Scoped allow: the `gguf` submodule name mirrors the Go source layout
+// (`fs/gguf/gguf.go`); renaming would churn the public `gguf::gguf::*` path.
+#[allow(clippy::module_inception)]
 pub mod gguf;
 pub mod graph;
 pub mod keyvalue;
