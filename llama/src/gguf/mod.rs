@@ -21,7 +21,7 @@ pub mod tensor;
 #[cfg(test)]
 pub(crate) mod testutil;
 
-pub use gguf::File;
+pub use gguf::{File, TensorDataReader};
 pub use keyvalue::{GgufValue, KeyValue, Value};
 pub use tensor::{TensorInfo, TensorType};
 

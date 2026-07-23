@@ -34,6 +34,9 @@ pub enum KvVal {
     F32(f32),
     Bool(bool),
     Str(String),
+    /// Raw (possibly non-UTF-8) string bytes, for exercising lossless string
+    /// parsing.
+    StrBytes(Vec<u8>),
     StrArray(Vec<String>),
     I32Array(Vec<i32>),
 }
@@ -65,8 +68,14 @@ pub struct TestTensor {
 
 /// Writes a GGUF-encoded length-prefixed string (Go's `writeStr`).
 pub fn write_str(b: &mut Vec<u8>, s: &str) {
+    write_str_bytes(b, s.as_bytes());
+}
+
+/// Writes a GGUF-encoded length-prefixed string from raw bytes (may be
+/// invalid UTF-8), for exercising lossless string parsing.
+pub fn write_str_bytes(b: &mut Vec<u8>, s: &[u8]) {
     b.extend_from_slice(&(s.len() as u64).to_le_bytes());
-    b.extend_from_slice(s.as_bytes());
+    b.extend_from_slice(s);
 }
 
 /// Writes a type-tagged GGUF metadata value (Go's `wValue`).
@@ -95,6 +104,10 @@ pub fn w_value(b: &mut Vec<u8>, v: &KvVal) {
         KvVal::Str(x) => {
             b.extend_from_slice(&W_STR.to_le_bytes());
             write_str(b, x);
+        }
+        KvVal::StrBytes(x) => {
+            b.extend_from_slice(&W_STR.to_le_bytes());
+            write_str_bytes(b, x);
         }
         KvVal::StrArray(xs) => {
             b.extend_from_slice(&W_ARRAY.to_le_bytes());

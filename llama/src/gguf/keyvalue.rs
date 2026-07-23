@@ -21,7 +21,12 @@ pub enum GgufValue {
     F32(f32),
     F64(f64),
     Bool(bool),
-    String(String),
+    /// Raw string bytes, stored losslessly (GGUF strings are not guaranteed
+    /// UTF-8 — vocab entries from byte-fallback BPE tokenizers commonly
+    /// contain arbitrary bytes). Mirrors Go's `string`, which holds raw bytes
+    /// without a UTF-8 validity guarantee. Use `Value::string`/`string_bytes`
+    /// to obtain a UTF-8 view (lossy) only at the point of use.
+    String(Vec<u8>),
 
     ArrayU8(Vec<u8>),
     ArrayI8(Vec<i8>),
@@ -34,7 +39,8 @@ pub enum GgufValue {
     ArrayF32(Vec<f32>),
     ArrayF64(Vec<f64>),
     ArrayBool(Vec<bool>),
-    ArrayString(Vec<String>),
+    /// Raw string bytes for each array element (see `String` above).
+    ArrayString(Vec<Vec<u8>>),
 }
 
 /// Wraps an arbitrary GGUF metadata value (mirrors Go's `Value`).
@@ -110,7 +116,10 @@ impl Value {
 
     /// Returns Value as a bool. If it is not a bool, returns false.
     pub fn bool(&self) -> bool {
-        matches!(&self.0, Some(GgufValue::Bool(true)))
+        match &self.0 {
+            Some(GgufValue::Bool(v)) => *v,
+            _ => false,
+        }
     }
 
     /// Returns Value as a bool slice. If not one, returns an empty Vec.
@@ -121,18 +130,47 @@ impl Value {
         }
     }
 
+    /// Returns Value as the raw string bytes, losslessly. If it is not a
+    /// string, returns an empty Vec. This is the lossless counterpart to
+    /// `string()` — use it when non-UTF-8 bytes (e.g. byte-fallback BPE
+    /// vocab entries) must be preserved exactly.
+    pub fn string_bytes(&self) -> &[u8] {
+        match &self.0 {
+            Some(GgufValue::String(v)) => v,
+            _ => &[],
+        }
+    }
+
     /// Returns Value as a string. If it is not a string, returns "".
+    ///
+    /// This decodes the raw bytes as UTF-8 lossily (invalid sequences become
+    /// U+FFFD) purely as a display/consumption convenience at the point of
+    /// use. Use `string_bytes()` when losslessness matters.
     pub fn string(&self) -> String {
         match &self.0 {
-            Some(GgufValue::String(v)) => v.clone(),
+            Some(GgufValue::String(v)) => String::from_utf8_lossy(v).into_owned(),
             _ => String::new(),
         }
     }
 
+    /// Returns Value as a slice of raw string byte vectors, losslessly. If
+    /// not a string array, returns an empty Vec.
+    pub fn strings_bytes(&self) -> &[Vec<u8>] {
+        match &self.0 {
+            Some(GgufValue::ArrayString(v)) => v,
+            _ => &[],
+        }
+    }
+
     /// Returns Value as a string slice. If not one, returns an empty Vec.
+    ///
+    /// Each element is decoded as UTF-8 lossily; see `string()`'s doc. Use
+    /// `strings_bytes()` when losslessness matters.
     pub fn strings(&self) -> Vec<String> {
         match &self.0 {
-            Some(GgufValue::ArrayString(v)) => v.clone(),
+            Some(GgufValue::ArrayString(v)) => {
+                v.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -178,8 +216,14 @@ impl KeyValue {
     pub fn string(&self) -> String {
         self.value.string()
     }
+    pub fn string_bytes(&self) -> &[u8] {
+        self.value.string_bytes()
+    }
     pub fn strings(&self) -> Vec<String> {
         self.value.strings()
+    }
+    pub fn strings_bytes(&self) -> &[Vec<u8>] {
+        self.value.strings_bytes()
     }
 }
 
@@ -194,8 +238,9 @@ mod tests {
         assert_eq!(Value::new(GgufValue::U16(9)).uint(), 9);
         assert_eq!(Value::new(GgufValue::F32(1.5)).float(), 1.5);
         assert!(Value::new(GgufValue::Bool(true)).bool());
-        assert_eq!(Value::new(GgufValue::String("hi".into())).string(), "hi");
-        assert_eq!(Value::new(GgufValue::String("hi".into())).int(), 0);
+        assert!(!Value::new(GgufValue::Bool(false)).bool());
+        assert_eq!(Value::new(GgufValue::String(b"hi".to_vec())).string(), "hi");
+        assert_eq!(Value::new(GgufValue::String(b"hi".to_vec())).int(), 0);
     }
 
     // Ported from keyvalue_test.go: TestValueSlices
@@ -206,8 +251,19 @@ mod tests {
             vec![1i64, 2, 3]
         );
         assert_eq!(
-            Value::new(GgufValue::ArrayString(vec!["a".into(), "b".into()])).strings(),
+            Value::new(GgufValue::ArrayString(vec![b"a".to_vec(), b"b".to_vec()])).strings(),
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    // New: lossless string bytes round-trip through the Value/KeyValue API.
+    #[test]
+    fn test_value_string_bytes_lossless() {
+        let raw = vec![0xFFu8, 0xFE, b'x', 0x00, 0x80];
+        let v = Value::new(GgufValue::String(raw.clone()));
+        assert_eq!(v.string_bytes(), raw.as_slice());
+
+        let arr = Value::new(GgufValue::ArrayString(vec![raw.clone()]));
+        assert_eq!(arr.strings_bytes(), &[raw]);
     }
 }

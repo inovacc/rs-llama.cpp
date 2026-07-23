@@ -155,9 +155,12 @@ impl File {
         self.tensors.iter().enumerate()
     }
 
-    /// Returns the `TensorInfo` and the raw bytes for the named tensor's
-    /// data. Errors if no tensor with that name (or a zero-byte one) exists.
-    pub fn tensor_reader(&self, name: &str) -> Result<(TensorInfo, std::io::Cursor<Vec<u8>>), GgufError> {
+    /// Returns the `TensorInfo` and a bounded, on-demand reader over the
+    /// named tensor's data. Mirrors Go's `io.NewSectionReader(f.at, ...)`:
+    /// the returned reader is seeked to the tensor's data but no bytes are
+    /// read from disk until the caller actually reads from it. Errors if no
+    /// tensor with that name (or a zero-byte one) exists.
+    pub fn tensor_reader(&self, name: &str) -> Result<(TensorInfo, TensorDataReader), GgufError> {
         let t = self.tensor_info(name);
         if t.num_bytes() == 0 {
             return Err(GgufError::TensorNotFound(name.to_string()));
@@ -167,10 +170,33 @@ impl File {
         let mut f = std::fs::File::open(&self.path)?;
         f.seek(SeekFrom::Start(self.offset + t.offset))?;
 
-        let mut buf = vec![0u8; t.num_bytes() as usize];
-        f.read_exact(&mut buf)?;
+        let reader = TensorDataReader {
+            file: f,
+            remaining: t.num_bytes() as u64,
+        };
 
-        Ok((t, std::io::Cursor::new(buf)))
+        Ok((t, reader))
+    }
+}
+
+/// A bounded, on-demand reader over a tensor's data section within the GGUF
+/// file (the Rust analogue of Go's `io.SectionReader`). Holds its own file
+/// handle already seeked to the tensor's start offset; bytes are read from
+/// disk lazily, only as the caller pulls them via `Read`.
+pub struct TensorDataReader {
+    file: std::fs::File,
+    remaining: u64,
+}
+
+impl Read for TensorDataReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let max = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.file.read(&mut buf[..max])?;
+        self.remaining -= n as u64;
+        Ok(n)
     }
 }
 
@@ -186,11 +212,22 @@ fn read<R: Read>(reader: &mut R) -> Result<u64, GgufError> {
     Ok(reader.read_u64::<LittleEndian>()?)
 }
 
-fn read_string<R: Read>(reader: &mut R) -> Result<String, GgufError> {
+/// Reads a length-prefixed GGUF string as raw bytes, losslessly (no UTF-8
+/// validation or lossy conversion at the parse layer — GGUF strings are not
+/// guaranteed to be valid UTF-8, e.g. byte-fallback BPE vocab entries).
+fn read_string_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>, GgufError> {
     let n = read(reader)?;
     let mut bts = vec![0u8; n as usize];
     reader.read_exact(&mut bts)?;
-    Ok(String::from_utf8_lossy(&bts).into_owned())
+    Ok(bts)
+}
+
+/// Reads a length-prefixed GGUF string as a UTF-8 `String` (lossy). Used only
+/// for fields consumed purely as Rust-native strings on the parse path itself
+/// (the tensor name and key-value key), matching Go's identifier-shaped
+/// usage; metadata *values* stay raw bytes end-to-end (see `read_string_bytes`).
+fn read_string<R: Read>(reader: &mut R) -> Result<String, GgufError> {
+    Ok(String::from_utf8_lossy(&read_string_bytes(reader)?).into_owned())
 }
 
 fn read_tensor<R: Read>(reader: &mut R) -> Result<TensorInfo, GgufError> {
@@ -237,7 +274,7 @@ fn read_value<R: Read>(reader: &mut R, t: u32) -> Result<GgufValue, GgufError> {
         TYPE_FLOAT32 => Ok(GgufValue::F32(reader.read_f32::<LittleEndian>()?)),
         TYPE_FLOAT64 => Ok(GgufValue::F64(reader.read_f64::<LittleEndian>()?)),
         TYPE_BOOL => Ok(GgufValue::Bool(reader.read_u8()? != 0)),
-        TYPE_STRING => Ok(GgufValue::String(read_string(reader)?)),
+        TYPE_STRING => Ok(GgufValue::String(read_string_bytes(reader)?)),
         TYPE_ARRAY => read_array(reader),
         other => Err(GgufError::UnsupportedType(other)),
     }
@@ -299,7 +336,7 @@ fn read_array<R: Read>(reader: &mut R) -> Result<GgufValue, GgufError> {
         TYPE_STRING => {
             let mut v = Vec::with_capacity(n as usize);
             for _ in 0..n {
-                v.push(read_string(reader)?);
+                v.push(read_string_bytes(reader)?);
             }
             Ok(GgufValue::ArrayString(v))
         }
@@ -310,7 +347,7 @@ fn read_array<R: Read>(reader: &mut R) -> Result<GgufValue, GgufError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::testutil::{sample_model, write_gguf, KvPair, TestTensor};
+    use crate::gguf::testutil::{sample_model, write_gguf, KvPair, KvVal, TestTensor};
 
     // Ported from gguf_test.go: TestOpenReadsHeaderAndKV
     #[test]
@@ -404,5 +441,38 @@ mod tests {
         assert_eq!(da.len(), 24);
         assert_eq!(da[0], 0x11);
         assert_eq!(da[23], 0x11);
+    }
+
+    // New: metadata string values containing invalid UTF-8 bytes must come
+    // back byte-for-byte identical (parse layer must not use
+    // from_utf8_lossy — that would corrupt/replace the invalid bytes).
+    #[test]
+    fn test_string_value_is_lossless_for_invalid_utf8() {
+        let raw: Vec<u8> = vec![0xFF, 0xFE, b'o', b'k', 0x80, 0x00, 0xC0];
+
+        let path = write_gguf(
+            &[
+                KvPair::str("general.architecture", "llama"),
+                KvPair {
+                    key: "tokenizer.raw_token".to_string(),
+                    val: KvVal::StrBytes(raw.clone()),
+                },
+            ],
+            &[],
+        );
+
+        let f = File::open(&path).expect("Open");
+        let kv = f.key_value("tokenizer.raw_token");
+        assert!(kv.valid());
+        assert_eq!(
+            kv.string_bytes(),
+            raw.as_slice(),
+            "string value bytes must be preserved losslessly, byte-for-byte"
+        );
+
+        // Sanity: the lossy `.string()` view must NOT equal the raw bytes
+        // interpreted directly (since it replaces invalid sequences), but
+        // still be usable without panicking.
+        let _ = kv.string();
     }
 }
