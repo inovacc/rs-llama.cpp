@@ -1,0 +1,6 @@
+# The llama.cpp build + C shim are compiled with MinGW gcc/g++ (GNU ABI), so the
+# whole workspace must target x86_64-pc-windows-gnu — an MSVC-ABI Rust binary
+# cannot link the gcc-built objects. Pinning it here means plain `cargo build`/
+# `cargo test` work without an explicit --target on every invocation.
+[build]
+target = "x86_64-pc-windows-gnu"
