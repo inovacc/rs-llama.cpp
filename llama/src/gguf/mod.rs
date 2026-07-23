@@ -5,8 +5,9 @@
 //! faithful to the Go byte-level parsing (magic, version, counts, kv/tensor
 //! entries, alignment/padding).
 //!
-//! Scope note: `metadata.go`, `graph.go`, `estimate.go`, and `lazy.go` are
-//! intentionally NOT part of this module yet — they land in later dispatches.
+//! Scope note: `estimate.go` and `lazy.go` are intentionally NOT part of this
+//! module yet — they land in later dispatches. `metadata.go` and `graph.go`
+//! are ported (see `metadata.rs`, `graph.rs`).
 //! The lazy-iterator abstraction from `lazy.go` is not ported as a separate
 //! generic type here: `File::open` parses key-values and tensor descriptors
 //! eagerly (in file-byte order), which yields identical externally-observable
@@ -14,7 +15,9 @@
 //! coroutine-style pull machinery.
 
 pub mod gguf;
+pub mod graph;
 pub mod keyvalue;
+pub mod metadata;
 pub mod reader;
 pub mod tensor;
 
@@ -22,7 +25,9 @@ pub mod tensor;
 pub(crate) mod testutil;
 
 pub use gguf::{File, TensorDataReader};
+pub use graph::llama_graph_size;
 pub use keyvalue::{GgufValue, KeyValue, Value};
+pub use metadata::{stat, Info};
 pub use tensor::{TensorInfo, TensorType};
 
 use thiserror::Error;
